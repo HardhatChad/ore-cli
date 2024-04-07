@@ -1,5 +1,4 @@
 use std::{
-    io::{stdout, Write},
     time::Duration,
 };
 
@@ -84,7 +83,7 @@ use crate::Miner;
 
 const RPC_RETRIES: usize = 0;
 const SIMULATION_RETRIES: usize = 4;
-const GATEWAY_RETRIES: usize = 4;
+const GATEWAY_RETRIES: usize = usize::MAX;
 const CONFIRM_RETRIES: usize = usize::MAX;
 
 impl Miner {
@@ -94,7 +93,6 @@ impl Miner {
         dynamic_cus: bool,
         skip_confirm: bool,
     ) -> ClientResult<Signature> {
-        let mut stdout = stdout();
         let signer = self.signer();
         let client =
             std::sync::Arc::new(RpcClient::new_with_commitment(self.cluster.clone(), CommitmentConfig::finalized()));
@@ -194,88 +192,82 @@ impl Miner {
         // Submit tx
         tx.sign(&[&signer], hash);
         let mut attempts = 0;
-        loop {
-
-        let client =
-            std::sync::Arc::new(RpcClient::new_with_commitment(self.cluster.clone(), CommitmentConfig::finalized()));
-            println!("Attempt: {:?}", attempts);
-
-        let tx = Transaction::from(tx.clone());
-        
-            match client.send_transaction_with_config(&tx.clone(), send_cfg).await {
+            let res = client.send_transaction_with_config(&tx, send_cfg.clone()).await;
+            match res {
                 Ok(sig) => {
-                    println!("{:?}", sig);
-
-                    // Confirm tx
                     if skip_confirm {
                         return Ok(sig);
                     }
-                    let _future = tokio::spawn(async move {
-                        for _ in 0..CONFIRM_RETRIES {
-                            std::thread::sleep(Duration::from_millis(2000));
-                            match client.get_signature_statuses(&vec![sig]).await {
-                                Ok(signature_statuses) => {
-                                    //println!("Confirms: {:?}", signature_statuses.value);
-                                    for signature_status in signature_statuses.value {
-                                        if let Some(signature_status) = signature_status.as_ref() {
-                                            if signature_status.confirmation_status.is_some() {
-                                                let current_commitment = signature_status
-                                                    .confirmation_status
-                                                    .as_ref()
-                                                    .unwrap();
-                                                match current_commitment {
-                                                    TransactionConfirmationStatus::Confirmed
-                                                    | TransactionConfirmationStatus::Finalized => {
-                                                        println!("Transaction landed!");
-                                                        return Ok(sig);
-                                                    },
-                                                    _ => {
-                                                        client.send_transaction_with_config(&tx.clone(), send_cfg).await?;
-                                                    }
-                                                }
-                                            } else {
-                                                println!("No status");
-                                            }
-                                        }
-                                        else {
-                                            client.send_transaction_with_config(&tx.clone(), send_cfg).await?;
-
-                                        }
-                                    }
-                                }
-
-                                // Handle confirmation errors
-                                Err(err) => {
-                                    println!("Error: {:?}", err);
-                                }
-                            }
-
+                    let client_clone = client.clone();
+                    let sig_clone = sig;
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = confirm_transaction(client_clone, &mut vec![sig_clone], tx_clone).await {
+                            println!("Background confirmation error: {:?}", e);
                         }
-                        println!("Transaction did not land");
+                    });
+                    Ok(sig)
+                }
+                Err(err) => {
+                    println!("Error: {:?}", err);
+                    attempts += 1;
+                    if attempts.gt(&GATEWAY_RETRIES) {
                         return Err(ClientError {
                             request: None,
-                            kind: ClientErrorKind::Custom("Transaction did not land".into()),
+                            kind: ClientErrorKind::Custom("Max retries".into()),
                         });
-                    });
-                    
+                    }
+                    return Err(err);
                 }
-                // Handle submit errors
-                Err(err) => {
-                    println!("Error {:?}", err);
+        }
+    }
+    }
+
+
+// Async function to confirm a transaction in the background
+async fn confirm_transaction(client: std::sync::Arc<RpcClient>, sigs : &mut Vec<Signature>,
+tx: Transaction
+) -> Result<(), ClientError> {
+    let mut attempts = 0;
+    loop {
+        // Use async sleep to delay without blocking
+       tokio::time::sleep(Duration::from_secs(2*attempts)).await;
+        println!("Checking transaction statuses {:?}", sigs);
+        match client.get_signature_statuses(&sigs).await {
+            Ok(statuses) => {
+                // Process the statuses to check if the transaction is confirmed...
+                for status in statuses.value.iter() {
+                    if let Some(status) = status {
+                        if let Some(confirmation_status) = &status.confirmation_status {
+                            match confirmation_status {
+                                TransactionConfirmationStatus::Confirmed
+                                | TransactionConfirmationStatus::Finalized => {
+                                    println!("Transaction confirmed!");
+                                    return Ok(());
+                                },
+                                _ => {
+                                    println!("Transaction not confirmed yet...");
+                                    sigs.push(client.send_transaction(&tx.clone()).await?);
+                                }
+                            }
+                        }
+                    }
                 }
+            },
+            Err(err) => {
+                println!("Error checking transaction status: {:?}", err);
             }
-            stdout.flush().ok();
+        }
 
-            // Retry
+        attempts += 1;
+        let _ = client.send_transaction(&tx.clone()).await;
 
-            std::thread::sleep(Duration::from_millis(2000));
-            attempts += 1;
-            if attempts > GATEWAY_RETRIES {
-                return Err(ClientError {
-                    request: None,
-                    kind: ClientErrorKind::Custom("Max retries".into()),
-                });
-            }
+        println!("Confirmation attempts: {:?}", attempts);
+        if attempts >= CONFIRM_RETRIES as u64 {
+            return Err(ClientError {
+                request: None,
+                kind: ClientErrorKind::Custom("Confirmation attempts exceeded".into()),
+            });
         }
     }
 }
