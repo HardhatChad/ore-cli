@@ -132,7 +132,7 @@ impl Miner {
             &nonce_manager.next().pubkey(), 
             &signer.pubkey());
 
-        let mut tx = Transaction::new_unsigned(msg);
+        let mut tx = Transaction::new_unsigned(msg.clone());
         
         // Simulate if necessary
         if dynamic_cus {
@@ -193,64 +193,72 @@ impl Miner {
 
         // Submit tx
         tx.sign(&[&signer], hash);
-        let mut sigs = vec![];
         let mut attempts = 0;
         loop {
+
+        let client =
+            std::sync::Arc::new(RpcClient::new_with_commitment(self.cluster.clone(), CommitmentConfig::finalized()));
             println!("Attempt: {:?}", attempts);
-            match client.send_transaction_with_config(&tx, send_cfg).await {
+
+        let tx = Transaction::from(tx.clone());
+        
+            match client.send_transaction_with_config(&tx.clone(), send_cfg).await {
                 Ok(sig) => {
-                    sigs.push(sig);
                     println!("{:?}", sig);
 
                     // Confirm tx
                     if skip_confirm {
                         return Ok(sig);
                     }
-                    for _ in 0..CONFIRM_RETRIES {
-                        std::thread::sleep(Duration::from_millis(2000));
-                        match client.get_signature_statuses(&sigs).await {
-                            Ok(signature_statuses) => {
-                                println!("Confirms: {:?}", signature_statuses.value);
-                                for signature_status in signature_statuses.value {
-                                    if let Some(signature_status) = signature_status.as_ref() {
-                                        if signature_status.confirmation_status.is_some() {
-                                            let current_commitment = signature_status
-                                                .confirmation_status
-                                                .as_ref()
-                                                .unwrap();
-                                            match current_commitment {
-                                                TransactionConfirmationStatus::Confirmed
-                                                | TransactionConfirmationStatus::Finalized => {
-                                                    println!("Transaction landed!");
-                                                    return Ok(sig);
-                                                },
-                                                _ => {
-                                                    println!("No status");
-                                                    sigs.push(client.send_transaction_with_config(&tx, send_cfg).await?);
+                    let _future = tokio::spawn(async move {
+                        for _ in 0..CONFIRM_RETRIES {
+                            std::thread::sleep(Duration::from_millis(2000));
+                            match client.get_signature_statuses(&vec![sig]).await {
+                                Ok(signature_statuses) => {
+                                    //println!("Confirms: {:?}", signature_statuses.value);
+                                    for signature_status in signature_statuses.value {
+                                        if let Some(signature_status) = signature_status.as_ref() {
+                                            if signature_status.confirmation_status.is_some() {
+                                                let current_commitment = signature_status
+                                                    .confirmation_status
+                                                    .as_ref()
+                                                    .unwrap();
+                                                match current_commitment {
+                                                    TransactionConfirmationStatus::Confirmed
+                                                    | TransactionConfirmationStatus::Finalized => {
+                                                        println!("Transaction landed!");
+                                                        return Ok(sig);
+                                                    },
+                                                    _ => {
+                                                        client.send_transaction_with_config(&tx.clone(), send_cfg).await?;
+                                                    }
                                                 }
+                                            } else {
+                                                println!("No status");
                                             }
-                                        } else {
-                                            println!("No status");
+                                        }
+                                        else {
+                                            client.send_transaction_with_config(&tx.clone(), send_cfg).await?;
+
                                         }
                                     }
-                                    else {
-                                        println!("No status");
-                                        sigs.push(client.send_transaction_with_config(&tx, send_cfg).await?);
+                                }
 
-                                    }
+                                // Handle confirmation errors
+                                Err(err) => {
+                                    println!("Error: {:?}", err);
                                 }
                             }
 
-                            // Handle confirmation errors
-                            Err(err) => {
-                                println!("Error: {:?}", err);
-                            }
                         }
-
-                    }
-                    println!("Transaction did not land");
+                        println!("Transaction did not land");
+                        return Err(ClientError {
+                            request: None,
+                            kind: ClientErrorKind::Custom("Transaction did not land".into()),
+                        });
+                    });
+                    
                 }
-
                 // Handle submit errors
                 Err(err) => {
                     println!("Error {:?}", err);
@@ -262,7 +270,6 @@ impl Miner {
 
             std::thread::sleep(Duration::from_millis(2000));
             attempts += 1;
-            client.send_transaction_with_config(&tx, send_cfg).await?;
             if attempts > GATEWAY_RETRIES {
                 return Err(ClientError {
                     request: None,
