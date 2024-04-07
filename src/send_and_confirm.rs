@@ -7,6 +7,7 @@ use solana_client::{
     nonblocking::rpc_client::RpcClient,
     rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
 };
+use solana_transaction_status::Encodable;
 use solana_program::instruction::Instruction;
 use solana_sdk::{
     commitment_config::{CommitmentConfig, CommitmentLevel},
@@ -15,7 +16,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
-
+use std::io::Write;
 
 const NONCE_RENT: u64 = 1_447_680;
 
@@ -25,6 +26,75 @@ pub struct NonceManager {
     pub capacity: u64,
     pub idx: u64,
 }
+async fn get_recent_priority_fee_estimate(request: GetPriorityFeeEstimateRequest) -> f64 {
+    let api_key = std::env::var("HELIUS_API_KEY").unwrap();
+    let response = reqwest::Client::new()
+        .post("https://mainnet.helius-rpc.com/?api-key=".to_owned() + &api_key)
+        .body(serde_json::json!(
+            {
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "getPriorityFeeEstimate",
+                "params": 
+            [
+                request
+            ]
+        }
+        ).to_string())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let request = serde_json::from_str::<serde_json::Value>(&response).unwrap();
+request["result"]["priorityFeeEstimate"].as_f64().unwrap_or(1200.0)
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+
+struct GetPriorityFeeEstimateRequest {
+  transaction: Option<String>,   // estimate fee for a serialized txn
+  account_keys: Option<Vec<String>>, // estimate fee for a list of accounts
+  options: Option<GetPriorityFeeEstimateOptions>
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct GetPriorityFeeEstimateOptions {
+	priority_level: Option<PriorityLevel>, // Default to MEDIUM
+	include_all_priority_fee_levels: Option<bool>, // Include all priority level estimates in the response
+	transaction_encoding: Option<UiTransactionEncoding>, // Default Base58
+	lookback_slots: Option<u8>, // number of slots to look back to calculate estimate. Valid number are 1-150, defualt is 150
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+enum PriorityLevel {
+	NONE, // 0th percentile
+	LOW, // 25th percentile
+	MEDIUM, // 50th percentile
+	HIGH, // 75th percentile
+	VERY_HIGH, // 95th percentile
+  // labelled unsafe to prevent people using and draining their funds by accident
+	UNSAFE_MAX, // 100th percentile 
+	DEFAULT, // 50th percentile
+}
+#[derive(serde::Deserialize)]
+struct GetPriorityFeeEstimateResponse {
+  priority_fee_estimate: Option<MicroLamportPriorityFee>,
+  priority_fee_levels: Option<MicroLamportPriorityFeeLevels>
+}
+
+type MicroLamportPriorityFee = f64;
+#[derive(serde::Deserialize)]
+struct MicroLamportPriorityFeeLevels {
+	none: f64,
+	low: f64,
+	medium: f64,
+	high: f64,
+	very_high: f64,
+	unsafe_max: f64,
+}
+
 impl NonceManager {
     pub fn new(rpc_client: std::sync::Arc<RpcClient>, authority: solana_sdk::pubkey::Pubkey, capacity: u64) -> Self {
         NonceManager {
@@ -96,8 +166,20 @@ impl Miner {
         let signer = self.signer();
         let client =
             std::sync::Arc::new(RpcClient::new_with_commitment(self.cluster.clone(), CommitmentConfig::finalized()));
-        let mut nonce_manager = NonceManager::new(client.clone(), signer.pubkey(), 1 as u64);
+        let mut nonce_manager = NonceManager::new(client.clone(), signer.pubkey(), 10 as u64);
             nonce_manager.try_init_all(&signer).await; 
+
+            nonce_manager.try_init_all(&signer).await; 
+
+
+            nonce_manager.try_init_all(&signer).await; 
+
+
+            nonce_manager.try_init_all(&signer).await; 
+
+
+            nonce_manager.try_init_all(&signer).await; 
+
 
         // Return error if balance is zero
         let balance = client
@@ -166,8 +248,18 @@ impl Miner {
                             let cu_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(
                                 units_consumed as u32 + 1000,
                             );
+                            let priority_fee = get_recent_priority_fee_estimate(GetPriorityFeeEstimateRequest {
+                                transaction: Some(bs58::encode(bincode::serialize(&tx).unwrap()).into_string()),
+                                account_keys: None,
+                                options: Some(GetPriorityFeeEstimateOptions {
+                                    priority_level: Some(PriorityLevel::HIGH),
+                                    include_all_priority_fee_levels: Some(false),
+                                    transaction_encoding: Some(UiTransactionEncoding::Base58),
+                                    lookback_slots: Some(150),
+                                }),
+                            }).await;
                             let cu_price_ix =
-                                ComputeBudgetInstruction::set_compute_unit_price(self.priority_fee);
+                                ComputeBudgetInstruction::set_compute_unit_price(priority_fee as u64);
                             let mut final_ixs = vec![];
                             final_ixs.extend_from_slice(&[cu_budget_ix, cu_price_ix]);
                             final_ixs.extend_from_slice(ixs);
@@ -231,7 +323,7 @@ tx: Transaction
     let mut attempts = 0;
     loop {
         // Use async sleep to delay without blocking
-       tokio::time::sleep(Duration::from_secs(2*attempts)).await;
+       tokio::time::sleep(Duration::from_secs((1.1*attempts as f64) as u64)).await;
         println!("Checking transaction statuses {:?}", sigs);
         match client.get_signature_statuses(&sigs).await {
             Ok(statuses) => {
@@ -242,7 +334,22 @@ tx: Transaction
                             match confirmation_status {
                                 TransactionConfirmationStatus::Confirmed
                                 | TransactionConfirmationStatus::Finalized => {
+                                    println!("---!");
                                     println!("Transaction confirmed!");
+                                    println!("---!");
+                                    println!("---!");
+                                    // append it to file, appending txs.csv
+                                    // append
+                                    let mut file = std::fs::OpenOptions::new()
+                                        .append(true)
+                                        .create(true)
+                                        .open("txs.csv")
+                                        .unwrap();
+                                    file.write_all(format!("{:?}\n", tx.signatures).as_bytes()).unwrap();
+
+                                    
+                    
+
                                     return Ok(());
                                 },
                                 _ => {
