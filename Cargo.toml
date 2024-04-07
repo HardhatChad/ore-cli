@@ -31,3 +31,4 @@ solana-transaction-status = "^1.16"
 spl-token = { version = "^4", features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "^2.2", features = [ "no-entrypoint" ] }
 tokio = "1.35.1"
+sha256 = "1.5.0"

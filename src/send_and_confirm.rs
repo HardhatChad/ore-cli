@@ -17,12 +17,75 @@ use solana_sdk::{
 };
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 
+
+const NONCE_RENT: u64 = 1_447_680;
+
+pub struct NonceManager {
+    pub rpc_client: std::sync::Arc<RpcClient>,
+    pub authority: solana_sdk::pubkey::Pubkey,
+    pub capacity: u64,
+    pub idx: u64,
+}
+impl NonceManager {
+    pub fn new(rpc_client: std::sync::Arc<RpcClient>, authority: solana_sdk::pubkey::Pubkey, capacity: u64) -> Self {
+        NonceManager {
+            rpc_client,
+            authority,
+            capacity,
+            idx: 0,
+        }
+    }
+
+    pub async fn try_init_all(&mut self, payer: &solana_sdk::signer::keypair::Keypair) -> Vec<Result<Signature, solana_client::client_error::ClientError>> {
+        let (blockhash, _) = self.rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::finalized()).await
+            .unwrap_or_default();
+        let mut sigs = vec![];
+        for _ in 0..self.capacity {
+            let nonce_account = self.next();
+            let ixs = self.maybe_create_ixs(&nonce_account.pubkey()).await;
+            if ixs.is_none() {
+                continue;
+            }
+            let ixs = ixs.unwrap();
+            let tx = Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[&payer, &nonce_account], blockhash);
+            sigs.push(self.rpc_client.send_transaction(&tx).await);
+        }
+        sigs
+    }
+
+    fn next_seed(&mut self) -> u64 {
+        let ret = self.idx;
+        self.idx = (self.idx + 1) % self.capacity;
+        ret
+    }
+
+    pub fn next(&mut self) -> solana_sdk::signer::keypair::Keypair {
+        let seed = format!("Nonce:{}:{}", self.authority.clone(), self.next_seed());
+        let seed = sha256::digest(seed.as_bytes());
+        let kp = solana_sdk::signer::keypair::keypair_from_seed(&seed.as_ref()).unwrap();
+        kp
+    }
+
+    pub async fn maybe_create_ixs(&mut self, nonce: &solana_sdk::pubkey::Pubkey) -> Option<Vec<Instruction>> {
+        if solana_client::nonce_utils::nonblocking::get_account(&self.rpc_client, nonce).await.is_ok() {
+            None
+        } else {
+            Some(solana_sdk::system_instruction::create_nonce_account(
+                    &self.authority,
+                    &nonce,
+                    &self.authority,
+                    NONCE_RENT,
+            ))
+        }
+    }
+}
 use crate::Miner;
 
 const RPC_RETRIES: usize = 0;
 const SIMULATION_RETRIES: usize = 4;
 const GATEWAY_RETRIES: usize = 4;
-const CONFIRM_RETRIES: usize = 4;
+const CONFIRM_RETRIES: usize = usize::MAX;
 
 impl Miner {
     pub async fn send_and_confirm(
@@ -34,11 +97,13 @@ impl Miner {
         let mut stdout = stdout();
         let signer = self.signer();
         let client =
-            RpcClient::new_with_commitment(self.cluster.clone(), CommitmentConfig::confirmed());
+            std::sync::Arc::new(RpcClient::new_with_commitment(self.cluster.clone(), CommitmentConfig::finalized()));
+        let mut nonce_manager = NonceManager::new(client.clone(), signer.pubkey(), 1 as u64);
+            nonce_manager.try_init_all(&signer).await; 
 
         // Return error if balance is zero
         let balance = client
-            .get_balance_with_commitment(&signer.pubkey(), CommitmentConfig::confirmed())
+            .get_balance_with_commitment(&signer.pubkey(), CommitmentConfig::finalized())
             .await
             .unwrap();
         if balance.value <= 0 {
@@ -49,19 +114,26 @@ impl Miner {
         }
 
         // Build tx
-        let (mut hash, mut slot) = client
-            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+        let (hash, slot) = client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::finalized())
             .await
             .unwrap();
-        let mut send_cfg = RpcSendTransactionConfig {
+        let send_cfg = RpcSendTransactionConfig {
             skip_preflight: true,
-            preflight_commitment: Some(CommitmentLevel::Confirmed),
+            preflight_commitment: Some(CommitmentLevel::Finalized),
             encoding: Some(UiTransactionEncoding::Base64),
             max_retries: Some(RPC_RETRIES),
             min_context_slot: Some(slot),
         };
-        let mut tx = Transaction::new_with_payer(ixs, Some(&signer.pubkey()));
+        
+       let msg = solana_sdk::message::Message::new_with_nonce( 
+        ixs.to_vec(),
+        Some(&signer.pubkey()), 
+            &nonce_manager.next().pubkey(), 
+            &signer.pubkey());
 
+        let mut tx = Transaction::new_unsigned(msg);
+        
         // Simulate if necessary
         if dynamic_cus {
             let mut sim_attempts = 0;
@@ -72,7 +144,7 @@ impl Miner {
                         RpcSimulateTransactionConfig {
                             sig_verify: false,
                             replace_recent_blockhash: true,
-                            commitment: Some(CommitmentConfig::confirmed()),
+                            commitment: Some(CommitmentConfig::finalized()),
                             encoding: Some(UiTransactionEncoding::Base64),
                             accounts: None,
                             min_context_slot: None,
@@ -147,16 +219,24 @@ impl Miner {
                                                 .as_ref()
                                                 .unwrap();
                                             match current_commitment {
-                                                TransactionConfirmationStatus::Processed => {}
                                                 TransactionConfirmationStatus::Confirmed
                                                 | TransactionConfirmationStatus::Finalized => {
                                                     println!("Transaction landed!");
                                                     return Ok(sig);
+                                                },
+                                                _ => {
+                                                    println!("No status");
+                                                    sigs.push(client.send_transaction_with_config(&tx, send_cfg).await?);
                                                 }
                                             }
                                         } else {
                                             println!("No status");
                                         }
+                                    }
+                                    else {
+                                        println!("No status");
+                                        sigs.push(client.send_transaction_with_config(&tx, send_cfg).await?);
+
                                     }
                                 }
                             }
@@ -166,6 +246,7 @@ impl Miner {
                                 println!("Error: {:?}", err);
                             }
                         }
+
                     }
                     println!("Transaction did not land");
                 }
@@ -178,20 +259,10 @@ impl Miner {
             stdout.flush().ok();
 
             // Retry
+
             std::thread::sleep(Duration::from_millis(2000));
-            (hash, slot) = client
-                .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-                .await
-                .unwrap();
-            send_cfg = RpcSendTransactionConfig {
-                skip_preflight: true,
-                preflight_commitment: Some(CommitmentLevel::Confirmed),
-                encoding: Some(UiTransactionEncoding::Base64),
-                max_retries: Some(RPC_RETRIES),
-                min_context_slot: Some(slot),
-            };
-            tx.sign(&[&signer], hash);
             attempts += 1;
+            client.send_transaction_with_config(&tx, send_cfg).await?;
             if attempts > GATEWAY_RETRIES {
                 return Err(ClientError {
                     request: None,
