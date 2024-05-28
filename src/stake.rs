@@ -37,7 +37,7 @@ impl Miner {
 
         // Send tx
         let ix = ore::instruction::stake(signer.pubkey(), sender, amount);
-        self.send_and_confirm(&[ix], ComputeBudget::Fixed(CU_LIMIT_CLAIM), false)
+        self.send_and_confirm(&[ix], ComputeBudget::Fixed(CU_LIMIT_CLAIM), false, false)
             .await
             .ok();
     }

@@ -1,0 +1,13 @@
+#!/bin/bash
+#
+if [ $# -ne 1 ]; then
+	echo "USAGE: $0 [wallet/miner integer]"
+	exit 1
+fi
+source ./ore_env.sh $1
+
+while true; do
+	# echo ----------------------------------------------------------------------------------------
+	./walletBalance.sh $1
+	sleep 60
+done

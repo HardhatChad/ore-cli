@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::time::Instant;
 
 use colored::*;
 use solana_client::{
@@ -10,6 +11,7 @@ use solana_program::{
     native_token::{lamports_to_sol, sol_to_lamports},
 };
 use solana_rpc_client::spinner;
+use solana_sdk::transaction::TransactionError;
 use solana_sdk::{
     commitment_config::CommitmentLevel,
     compute_budget::ComputeBudgetInstruction,
@@ -24,11 +26,16 @@ const MIN_SOL_BALANCE: f64 = 0.005;
 
 const RPC_RETRIES: usize = 0;
 const _SIMULATION_RETRIES: usize = 4;
-const GATEWAY_RETRIES: usize = 150;
-const CONFIRM_RETRIES: usize = 1;
 
-const CONFIRM_DELAY: u64 = 0;
-const GATEWAY_DELAY: u64 = 300;
+
+// Failing Transaction time = GATEWAY_RETRIES * GATEWAY_DELAY = 40 * 250ms = 10s
+const GATEWAY_RETRIES: usize = 40;	// How many times to retry a failed transaction - Reducing this value to 1 triggers regular ERROR-D
+const GATEWAY_DELAY: u64 = 250;		// Delay in ms before retrying a failed transaction
+
+// Time spent waiting for confirmation of transaction = CONFIRM_RETRIES * CONFIRM_DELAY = 1 * 50 = 50ms
+const CONFIRM_RETRIES: usize = 9;	// try to get transaction confirmation this many times
+const CONFIRM_DELAY: u64 = 50;		// Delay in ms between reach confirmation check
+
 
 pub enum ComputeBudget {
     Dynamic,
@@ -36,27 +43,32 @@ pub enum ComputeBudget {
 }
 
 impl Miner {
-    pub async fn send_and_confirm(
+	pub async fn send_and_confirm(
         &self,
         ixs: &[Instruction],
         compute_budget: ComputeBudget,
         skip_confirm: bool,
+		skip_sol_check: bool,
     ) -> ClientResult<Signature> {
-        let progress_bar = spinner::new_progress_bar();
-        let signer = self.signer();
+		
+		let signer = self.signer();
         let client = self.rpc_client.clone();
+		let submit_start_time: Instant = Instant::now();
+		let mut log_tx=String::from("");
 
         // Return error, if balance is zero
-        if let Ok(balance) = client.get_balance(&signer.pubkey()).await {
-            if balance <= sol_to_lamports(MIN_SOL_BALANCE) {
-                panic!(
-                    "{} Insufficient balance: {} SOL\nPlease top up with at least {} SOL",
-                    "ERROR".bold().red(),
-                    lamports_to_sol(balance),
-                    MIN_SOL_BALANCE
-                );
-            }
-        }
+		if !skip_sol_check {
+			if let Ok(balance) = client.get_balance(&signer.pubkey()).await {
+				if balance <= sol_to_lamports(MIN_SOL_BALANCE) {
+					panic!(
+						"{} Insufficient balance: {} SOL\nPlease top up with at least {} SOL",
+						"ERROR".bold().red(),
+						lamports_to_sol(balance),
+						MIN_SOL_BALANCE
+					);
+				}
+			}
+		}
 
         // Set compute units
         let mut final_ixs = vec![];
@@ -89,45 +101,79 @@ impl Miner {
             .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
             .await
             .unwrap();
-        tx.sign(&[&signer], hash);
+        tx.sign(&[&signer], hash);		// Commenting out this line enables tesing a failed transation
 
         // Submit tx
-        let mut attempts = 0;
-        loop {
-            progress_bar.set_message(format!("Submitting transaction... (attempt {})", attempts));
-            match client.send_transaction_with_config(&tx, send_cfg).await {
+        let mut attempts = 1;
+		let progress_bar = spinner::new_progress_bar();
+		loop {
+			progress_bar.set_message(format!("[{}{}]  Attempt {}: Submitting transaction...",
+				submit_start_time.elapsed().as_secs().to_string().dimmed(),
+				"s".dimmed(),
+				attempts,
+			));
+			match client.send_transaction_with_config(&tx, send_cfg).await {
                 Ok(sig) => {
-                    // Skip confirmation
+					progress_bar.set_message(format!("[{}{}]  Attempt {}: awaiting transaction to complete...",
+						submit_start_time.elapsed().as_secs().to_string().dimmed(),
+						"s".dimmed(),
+						attempts,
+					));
+	
+					// Skip confirmation
                     if skip_confirm {
-                        progress_bar.finish_with_message(format!("Sent: {}", sig));
+						let mess=format!("[{}{}]  Attempt {}: Sent: {}",
+							submit_start_time.elapsed().as_secs().to_string().dimmed(),
+							"s".dimmed(),
+							attempts,
+							sig.to_string().dimmed(),
+						);
+                        progress_bar.finish_with_message(mess.clone());
+						log_tx+=mess.as_str();
                         return Ok(sig);
                     }
 
                     // Confirm the tx landed
-                    for _ in 0..CONFIRM_RETRIES {
+                    for confirm_counter in 0..CONFIRM_RETRIES {
                         std::thread::sleep(Duration::from_millis(CONFIRM_DELAY));
                         match client.get_signature_statuses(&[sig]).await {
                             Ok(signature_statuses) => {
                                 for status in signature_statuses.value {
                                     if let Some(status) = status {
-                                        if let Some(err) = status.err {
-                                            progress_bar.set_message(format!("Error: {}", err));
-                                            return Err(ClientError {
-                                                request: None,
-                                                kind: ClientErrorKind::Custom(err.to_string()),
-                                            });
+										progress_bar.set_message(format!("[{}{}]  Attempt {}: Check transaction Status...",
+											submit_start_time.elapsed().as_secs().to_string().dimmed(),
+											"s".dimmed(),
+											attempts,
+										));
+				
+										if let Some(err) = status.err {
+											let pretty_error_message=self.lookup_ore_error_description(err.clone());
+                                            progress_bar.set_message(format!("[{}{}]  Attempt {}-{}: {} {}",
+												submit_start_time.elapsed().as_secs().to_string().dimmed(),
+												"s".dimmed(),
+												attempts,
+												confirm_counter+1,
+												"ERROR-A".bold().red(),
+												pretty_error_message.bold().red(),
+											));
                                         }
                                         if let Some(confirmation) = status.confirmation_status {
                                             match confirmation {
                                                 TransactionConfirmationStatus::Processed => {}
                                                 TransactionConfirmationStatus::Confirmed
                                                 | TransactionConfirmationStatus::Finalized => {
-                                                    progress_bar.finish_with_message(format!(
-                                                        "{} {}",
-                                                        "OK".bold().green(),
-                                                        sig
-                                                    ));
-                                                    return Ok(sig);
+                                                    let mess=format!(
+                                                        "[{}{}]  Attempt {}-{}: {}\t\tTxid: {}",
+														submit_start_time.elapsed().as_secs().to_string().dimmed(),
+														"s".dimmed(),
+														attempts,
+														confirm_counter+1,
+                                                        "SUCCESS".bold().green(),
+                                                        sig.to_string().dimmed()
+                                                    );
+                                                    progress_bar.finish_with_message(mess.clone());
+													log_tx+=mess.as_str();
+													return Ok(sig);
                                                 }
                                             }
                                         }
@@ -137,11 +183,14 @@ impl Miner {
 
                             // Handle confirmation errors
                             Err(err) => {
-                                progress_bar.set_message(format!(
-                                    "{}: {}",
-                                    "ERROR".bold().red(),
-                                    err.kind().to_string()
+                                progress_bar.set_message(format!("[{}{}]  Attempt {}: {} {}",
+									submit_start_time.elapsed().as_secs().to_string().dimmed(),
+									"s".dimmed(),
+									attempts,
+									"ERROR-B".bold().red(),
+									err.kind().to_string().bold().red(),
                                 ));
+								println!(""); // leave error visible
                             }
                         }
                     }
@@ -149,26 +198,62 @@ impl Miner {
 
                 // Handle submit errors
                 Err(err) => {
-                    progress_bar.set_message(format!(
-                        "{}: {}",
-                        "ERROR".bold().red(),
-                        err.kind().to_string()
+                    progress_bar.set_message(format!("[{}{}]  Attempt {}: {} {}",
+						submit_start_time.elapsed().as_secs().to_string().dimmed(),
+						"s".dimmed(),
+						attempts,
+						"ERROR-C".bold().red(),
+						err.kind().to_string().bold().red(),
                     ));
+					println!(""); // leave error visible
                 }
             }
 
             // Retry
-            std::thread::sleep(Duration::from_millis(GATEWAY_DELAY));
-            attempts += 1;
+			attempts += 1;
             if attempts > GATEWAY_RETRIES {
-                progress_bar.finish_with_message(format!("{}: Max retries", "ERROR".bold().red()));
+				let error_message=format!("Failed due to reaching max gateway retry limit ({})", GATEWAY_RETRIES);
+                let mess=format!("[{}{}]  Attempt {}: {}: {}",
+					submit_start_time.elapsed().as_secs().to_string().dimmed(),
+					"s".dimmed(),
+					attempts,
+					"ERROR-D".bold().red(),
+					error_message.bold().red(),
+				);
+				progress_bar.finish_with_message(mess.clone());
+				log_tx+=mess.as_str();
                 return Err(ClientError {
                     request: None,
-                    kind: ClientErrorKind::Custom("Max retries".into()),
+                    kind: ClientErrorKind::Custom(error_message.into()),
                 });
             }
+			// Try again to send transaction after a small delay
+            std::thread::sleep(Duration::from_millis(GATEWAY_DELAY));
         }
     }
+
+	// Add a human description to the ORE transaction error number (copied from error.rs in the ORE repository)
+	fn lookup_ore_error_description(&self, err: TransactionError) -> String {
+		let error_message=err.to_string();
+		let mut additional_text="";
+		if error_message.contains("0x0") { additional_text=": Mining is paused"; }
+		if error_message.contains("0x1") { additional_text=": The epoch has ended and needs reset"; }
+		if error_message.contains("0x2") { additional_text=": The provided hash is invalid"; }
+		if error_message.contains("0x3") { additional_text=": The provided hash did not satisfy the minimum required difficulty"; }
+		if error_message.contains("0x4") { additional_text=": The claim amount cannot be greater than the claimable rewards"; }
+		if error_message.contains("0x5") { additional_text=": The clock time is invalid"; }
+		if error_message.contains("0x6") { additional_text=": Only one hash may be validated per transaction"; }
+		if error_message.contains("0x7") { additional_text=": The tolerance cannot exceed i64 max value"; }
+		if error_message.contains("0x8") { additional_text=": The tolerance cannot exceed i64 max value"; }
+
+		if additional_text=="" {
+			// return original error message as a string
+			error_message
+		} else {
+			// return original error + extra description as a string
+			error_message+additional_text
+		}
+	}
 
     // TODO
     fn _simulate(&self) {

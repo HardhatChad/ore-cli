@@ -1,2 +1,7 @@
 /target
 output.log
+ore_env.priv.sh
+/ore
+currentPriceOf*.txt
+logs
+cv_debug.log

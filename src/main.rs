@@ -109,6 +109,7 @@ struct Args {
 }
 
 #[tokio::main]
+
 async fn main() {
     let args = Args::parse();
 
@@ -128,7 +129,6 @@ async fn main() {
     let cluster = args.rpc.unwrap_or(cli_config.json_rpc_url);
     let default_keypair = args.keypair.unwrap_or(cli_config.keypair_path);
     let rpc_client = RpcClient::new_with_commitment(cluster, CommitmentConfig::confirmed());
-
     let miner = Arc::new(Miner::new(
         Arc::new(rpc_client),
         args.priority_fee,
@@ -191,4 +191,5 @@ impl Miner {
             None => panic!("No keypair provided"),
         }
     }
+
 }

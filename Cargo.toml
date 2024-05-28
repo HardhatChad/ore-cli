@@ -36,3 +36,6 @@ solana-transaction-status = "^1.18"
 spl-token = { version = "^4", features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "^2.2", features = [ "no-entrypoint" ] }
 tokio = "1.35.1"
+indicatif = "0.17.8"
+systemstat = "0.2.3"
+humantime = "2.1.0"

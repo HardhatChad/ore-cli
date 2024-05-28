@@ -41,7 +41,7 @@ impl Miner {
         }
 
         let ix = ore::instruction::claim(pubkey, beneficiary, amount);
-        self.send_and_confirm(&[ix], ComputeBudget::Fixed(CU_LIMIT_CLAIM), false)
+        self.send_and_confirm(&[ix], ComputeBudget::Fixed(CU_LIMIT_CLAIM), false, false)
             .await
             .ok();
     }
@@ -68,7 +68,7 @@ impl Miner {
             &ore::MINT_ADDRESS,
             &spl_token::id(),
         );
-        self.send_and_confirm(&[ix], ComputeBudget::Dynamic, false)
+        self.send_and_confirm(&[ix], ComputeBudget::Dynamic, false, false)
             .await
             .ok();
 
