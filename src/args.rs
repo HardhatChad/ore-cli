@@ -96,3 +96,13 @@ pub struct StakeArgs {
 pub struct UpdateAdminArgs {
     pub new_admin: String,
 }
+
+#[derive(Parser, Debug)]
+pub struct UpgradeArgs {
+    #[arg(
+        long,
+        value_name = "AMOUNT",
+        help = "The amount of Ore to upgrade from v1 to v2. Defaults to max."
+    )]
+    pub amount: Option<f64>,
+}
